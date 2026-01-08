@@ -3,39 +3,35 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import uuid
 import pytest
-from sanic_testing import TestManager
 import os
-from sanic import Sanic
-from sanic_ext import Extend
 
+from cmd_chat.server.server import ChatServer
 from cmd_chat.server.managers import ConnectionManager
 from cmd_chat.server.stores import MessageStore, UserSessionStore
 from cmd_chat.server.srp_auth import SRPAuthManager
-from cmd_chat.server.routes import register_routes
 
 
 @pytest.fixture
-def app():
-    name = f"test-{uuid.uuid4().hex[:8]}"
-
-    app = Sanic(name)
-    Extend(app)
-
-    app.ctx.message_store = MessageStore()
-    app.ctx.session_store = UserSessionStore()
-    app.ctx.connection_manager = ConnectionManager()
-    app.ctx.srp_manager = SRPAuthManager("testpassword")
-    app.ctx.room_salt = os.urandom(16)
-    app.ctx.cleanup_task = None
-
-    register_routes(app)
-    TestManager(app)
-
-    return app
+def server():
+    return ChatServer(password="testpassword")
 
 
 @pytest.fixture
-def test_client(app):
-    return app.test_client
+def message_store():
+    return MessageStore()
+
+
+@pytest.fixture
+def session_store():
+    return UserSessionStore()
+
+
+@pytest.fixture
+def connection_manager():
+    return ConnectionManager()
+
+
+@pytest.fixture
+def srp_manager():
+    return SRPAuthManager("testpassword")

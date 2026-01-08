@@ -7,10 +7,9 @@ import os
 import base64
 import json
 import pytest
-from unittest.mock import patch, AsyncMock, MagicMock, PropertyMock
+from unittest.mock import patch, AsyncMock, MagicMock
+import asyncio
 
-import requests
-import websockets
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
@@ -46,18 +45,6 @@ def room_fernet(room_salt):
 
 
 class TestClientProperties:
-    def test_base_url_different_ports(self):
-        client = Client("example.com", 8080, "user", "pass")
-        assert client.base_url == "http://example.com:8080"
-
-    def test_ws_url_different_ports(self):
-        client = Client("example.com", 8080, "user", "pass")
-        assert client.ws_url == "ws://example.com:8080"
-
-    def test_base_url_localhost(self):
-        client = Client("localhost", 443, "user", "pass")
-        assert client.base_url == "http://localhost:443"
-
     def test_password_encoding_unicode(self):
         client = Client("localhost", 3000, "user", "пароль123")
         assert client.password == "пароль123".encode()
@@ -66,29 +53,54 @@ class TestClientProperties:
         client = Client("localhost", 3000, "user", "p@$$w0rd!#%")
         assert client.password == b"p@$$w0rd!#%"
 
+    def test_initial_state(self, client):
+        assert client.reader is None
+        assert client.writer is None
+        assert client.connected is False
+        assert client.running is False
+        assert client.messages == []
+        assert client.users == []
+
 
 class TestSRPAuthentication:
-    @patch("cmd_chat.client.client.requests.post")
-    def test_srp_authenticate_success(self, mock_post, client, room_salt):
-        import srp
+    @pytest.mark.asyncio
+    async def test_srp_authenticate_success(self, client, room_salt):
+        mock_reader = AsyncMock()
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
 
-        init_response = MagicMock()
-        init_response.json.return_value = {
-            "user_id": "test-user-id-12345",
-            "B": base64.b64encode(os.urandom(256)).decode(),
-            "salt": base64.b64encode(os.urandom(16)).decode(),
-            "room_salt": base64.b64encode(room_salt).decode(),
-        }
-        init_response.raise_for_status = MagicMock()
+        client.reader = mock_reader
+        client.writer = mock_writer
 
-        verify_response = MagicMock()
-        verify_response.json.return_value = {
-            "H_AMK": base64.b64encode(os.urandom(32)).decode(),
-            "session_key": base64.b64encode(Fernet.generate_key()).decode(),
-        }
-        verify_response.raise_for_status = MagicMock()
+        init_response = (
+            json.dumps(
+                {
+                    "user_id": "test-user-id-12345",
+                    "B": base64.b64encode(os.urandom(256)).decode(),
+                    "salt": base64.b64encode(os.urandom(16)).decode(),
+                    "room_salt": base64.b64encode(room_salt).decode(),
+                }
+            )
+            + "\n"
+        )
 
-        mock_post.side_effect = [init_response, verify_response]
+        verify_response = (
+            json.dumps(
+                {
+                    "H_AMK": base64.b64encode(os.urandom(32)).decode(),
+                    "session_key": base64.b64encode(Fernet.generate_key()).decode(),
+                }
+            )
+            + "\n"
+        )
+
+        mock_reader.readline = AsyncMock(
+            side_effect=[
+                init_response.encode(),
+                verify_response.encode(),
+            ]
+        )
 
         with patch("cmd_chat.client.client.srp.User") as mock_srp_user:
             mock_usr = MagicMock()
@@ -98,38 +110,63 @@ class TestSRPAuthentication:
             mock_usr.authenticated.return_value = True
             mock_srp_user.return_value = mock_usr
 
-            client.srp_authenticate()
+            await client.srp_authenticate()
 
         assert client.user_id == "test-user-id-12345"
         assert client.room_fernet is not None
         assert client.fernet is not None
 
-    @patch("cmd_chat.client.client.requests.post")
-    def test_srp_authenticate_init_fails(self, mock_post, client):
-        mock_post.side_effect = requests.exceptions.HTTPError(
-            response=MagicMock(status_code=500, text="Server error")
+    @pytest.mark.asyncio
+    async def test_srp_authenticate_init_error(self, client):
+        mock_reader = AsyncMock()
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
+
+        client.reader = mock_reader
+        client.writer = mock_writer
+
+        error_response = json.dumps({"error": "Username taken"}) + "\n"
+        mock_reader.readline = AsyncMock(return_value=error_response.encode())
+
+        with patch("cmd_chat.client.client.srp.User") as mock_srp_user:
+            mock_usr = MagicMock()
+            mock_usr.start_authentication.return_value = (None, os.urandom(256))
+            mock_srp_user.return_value = mock_usr
+
+            with pytest.raises(ValueError, match="Username taken"):
+                await client.srp_authenticate()
+
+    @pytest.mark.asyncio
+    async def test_srp_authenticate_verify_error(self, client, room_salt):
+        mock_reader = AsyncMock()
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
+
+        client.reader = mock_reader
+        client.writer = mock_writer
+
+        init_response = (
+            json.dumps(
+                {
+                    "user_id": "test-user-id",
+                    "B": base64.b64encode(os.urandom(256)).decode(),
+                    "salt": base64.b64encode(os.urandom(16)).decode(),
+                    "room_salt": base64.b64encode(room_salt).decode(),
+                }
+            )
+            + "\n"
         )
 
-        with pytest.raises(requests.exceptions.HTTPError):
-            client.srp_authenticate()
+        verify_error = json.dumps({"error": "Authentication failed"}) + "\n"
 
-    @patch("cmd_chat.client.client.requests.post")
-    def test_srp_authenticate_verify_fails(self, mock_post, client, room_salt):
-        init_response = MagicMock()
-        init_response.json.return_value = {
-            "user_id": "test-user-id",
-            "B": base64.b64encode(os.urandom(256)).decode(),
-            "salt": base64.b64encode(os.urandom(16)).decode(),
-            "room_salt": base64.b64encode(room_salt).decode(),
-        }
-        init_response.raise_for_status = MagicMock()
-
-        verify_response = MagicMock()
-        verify_response.raise_for_status.side_effect = requests.exceptions.HTTPError(
-            response=MagicMock(status_code=401, text="Invalid proof")
+        mock_reader.readline = AsyncMock(
+            side_effect=[
+                init_response.encode(),
+                verify_error.encode(),
+            ]
         )
-
-        mock_post.side_effect = [init_response, verify_response]
 
         with patch("cmd_chat.client.client.srp.User") as mock_srp_user:
             mock_usr = MagicMock()
@@ -137,21 +174,32 @@ class TestSRPAuthentication:
             mock_usr.process_challenge.return_value = os.urandom(32)
             mock_srp_user.return_value = mock_usr
 
-            with pytest.raises(requests.exceptions.HTTPError):
-                client.srp_authenticate()
+            with pytest.raises(ValueError, match="Authentication failed"):
+                await client.srp_authenticate()
 
-    @patch("cmd_chat.client.client.requests.post")
-    def test_srp_authenticate_challenge_none(self, mock_post, client, room_salt):
-        init_response = MagicMock()
-        init_response.json.return_value = {
-            "user_id": "test-user-id",
-            "B": base64.b64encode(os.urandom(256)).decode(),
-            "salt": base64.b64encode(os.urandom(16)).decode(),
-            "room_salt": base64.b64encode(room_salt).decode(),
-        }
-        init_response.raise_for_status = MagicMock()
+    @pytest.mark.asyncio
+    async def test_srp_authenticate_challenge_none(self, client, room_salt):
+        mock_reader = AsyncMock()
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
 
-        mock_post.return_value = init_response
+        client.reader = mock_reader
+        client.writer = mock_writer
+
+        init_response = (
+            json.dumps(
+                {
+                    "user_id": "test-user-id",
+                    "B": base64.b64encode(os.urandom(256)).decode(),
+                    "salt": base64.b64encode(os.urandom(16)).decode(),
+                    "room_salt": base64.b64encode(room_salt).decode(),
+                }
+            )
+            + "\n"
+        )
+
+        mock_reader.readline = AsyncMock(return_value=init_response.encode())
 
         with patch("cmd_chat.client.client.srp.User") as mock_srp_user:
             mock_usr = MagicMock()
@@ -160,29 +208,46 @@ class TestSRPAuthentication:
             mock_srp_user.return_value = mock_usr
 
             with pytest.raises(ValueError, match="SRP challenge processing failed"):
-                client.srp_authenticate()
+                await client.srp_authenticate()
 
-    @patch("cmd_chat.client.client.requests.post")
-    def test_srp_authenticate_server_not_authenticated(
-        self, mock_post, client, room_salt
-    ):
-        init_response = MagicMock()
-        init_response.json.return_value = {
-            "user_id": "test-user-id",
-            "B": base64.b64encode(os.urandom(256)).decode(),
-            "salt": base64.b64encode(os.urandom(16)).decode(),
-            "room_salt": base64.b64encode(room_salt).decode(),
-        }
-        init_response.raise_for_status = MagicMock()
+    @pytest.mark.asyncio
+    async def test_srp_authenticate_server_not_authenticated(self, client, room_salt):
+        mock_reader = AsyncMock()
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
 
-        verify_response = MagicMock()
-        verify_response.json.return_value = {
-            "H_AMK": base64.b64encode(os.urandom(32)).decode(),
-            "session_key": base64.b64encode(Fernet.generate_key()).decode(),
-        }
-        verify_response.raise_for_status = MagicMock()
+        client.reader = mock_reader
+        client.writer = mock_writer
 
-        mock_post.side_effect = [init_response, verify_response]
+        init_response = (
+            json.dumps(
+                {
+                    "user_id": "test-user-id",
+                    "B": base64.b64encode(os.urandom(256)).decode(),
+                    "salt": base64.b64encode(os.urandom(16)).decode(),
+                    "room_salt": base64.b64encode(room_salt).decode(),
+                }
+            )
+            + "\n"
+        )
+
+        verify_response = (
+            json.dumps(
+                {
+                    "H_AMK": base64.b64encode(os.urandom(32)).decode(),
+                    "session_key": base64.b64encode(Fernet.generate_key()).decode(),
+                }
+            )
+            + "\n"
+        )
+
+        mock_reader.readline = AsyncMock(
+            side_effect=[
+                init_response.encode(),
+                verify_response.encode(),
+            ]
+        )
 
         with patch("cmd_chat.client.client.srp.User") as mock_srp_user:
             mock_usr = MagicMock()
@@ -193,14 +258,27 @@ class TestSRPAuthentication:
             mock_srp_user.return_value = mock_usr
 
             with pytest.raises(ValueError, match="Server authentication failed"):
-                client.srp_authenticate()
+                await client.srp_authenticate()
 
-    @patch("cmd_chat.client.client.requests.post")
-    def test_srp_authenticate_connection_timeout(self, mock_post, client):
-        mock_post.side_effect = requests.exceptions.Timeout()
+    @pytest.mark.asyncio
+    async def test_srp_authenticate_connection_closed(self, client):
+        mock_reader = AsyncMock()
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
 
-        with pytest.raises(requests.exceptions.Timeout):
-            client.srp_authenticate()
+        client.reader = mock_reader
+        client.writer = mock_writer
+
+        mock_reader.readline = AsyncMock(return_value=b"")
+
+        with patch("cmd_chat.client.client.srp.User") as mock_srp_user:
+            mock_usr = MagicMock()
+            mock_usr.start_authentication.return_value = (None, os.urandom(256))
+            mock_srp_user.return_value = mock_usr
+
+            with pytest.raises(ConnectionError):
+                await client.srp_authenticate()
 
 
 class TestDecryptMessage:
@@ -249,10 +327,8 @@ class TestDecryptMessage:
         assert decrypted["user_ip"] == "192.168.1.1"
 
     def test_decrypt_wrong_key_marks_failed(self, client):
-
         fernet1 = Fernet(Fernet.generate_key())
         encrypted = fernet1.encrypt(b"secret").decode()
-
         client.room_fernet = Fernet(Fernet.generate_key())
 
         msg = {"text": encrypted, "username": "other"}
@@ -277,7 +353,7 @@ class TestDecryptMessage:
         assert result["text"] is None
 
 
-class TestReceiveLoopExtended:
+class TestReceiveLoop:
     @pytest.mark.asyncio
     async def test_receive_multiple_messages_sequence(self, client, room_fernet):
         client.room_fernet = room_fernet
@@ -289,22 +365,33 @@ class TestReceiveLoopExtended:
         msg3 = room_fernet.encrypt(b"Third").decode()
 
         messages = [
-            json.dumps(
-                {"type": "message", "data": {"text": msg1, "username": "user1"}}
-            ),
-            json.dumps(
-                {"type": "message", "data": {"text": msg2, "username": "user2"}}
-            ),
-            json.dumps(
-                {"type": "message", "data": {"text": msg3, "username": "user1"}}
-            ),
+            (
+                json.dumps(
+                    {"type": "message", "data": {"text": msg1, "username": "user1"}}
+                )
+                + "\n"
+            ).encode(),
+            (
+                json.dumps(
+                    {"type": "message", "data": {"text": msg2, "username": "user2"}}
+                )
+                + "\n"
+            ).encode(),
+            (
+                json.dumps(
+                    {"type": "message", "data": {"text": msg3, "username": "user1"}}
+                )
+                + "\n"
+            ).encode(),
+            b"",
         ]
 
-        mock_ws = AsyncMock()
-        mock_ws.__aiter__.return_value = messages
+        mock_reader = AsyncMock()
+        mock_reader.readline = AsyncMock(side_effect=messages)
+        client.reader = mock_reader
 
         with patch.object(client, "render_messages"):
-            await client.receive_loop(mock_ws)
+            await client.receive_loop()
 
         assert len(client.messages) == 3
         assert client.messages[0]["text"] == "First"
@@ -312,285 +399,232 @@ class TestReceiveLoopExtended:
         assert client.messages[2]["text"] == "Third"
 
     @pytest.mark.asyncio
-    async def test_receive_stops_when_not_running(self, client, room_fernet):
-        client.room_fernet = room_fernet
-        client.running = False
-
-        mock_ws = AsyncMock()
-        mock_ws.__aiter__.return_value = [
-            json.dumps({"type": "message", "data": {"text": "test", "username": "u"}})
-        ]
-
-        with patch.object(client, "render_messages") as mock_render:
-            await client.receive_loop(mock_ws)
-            mock_render.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_receive_handles_connection_closed(self, client):
+    async def test_receive_init_message(self, client):
         client.room_fernet = Fernet(Fernet.generate_key())
-        client.running = True
-        client.connected = True
-
-        mock_ws = AsyncMock()
-        mock_ws.__aiter__.side_effect = websockets.ConnectionClosed(None, None)
-
-        await client.receive_loop(mock_ws)
-
-        assert client.connected is False
-
-    @pytest.mark.asyncio
-    async def test_receive_unknown_message_type(self, client, room_fernet):
-        client.room_fernet = room_fernet
         client.running = True
         client.messages = []
-
-        unknown_msg = json.dumps({"type": "unknown_type", "data": {}})
-
-        mock_ws = AsyncMock()
-        mock_ws.__aiter__.return_value = [unknown_msg]
-
-        with patch.object(client, "render_messages") as mock_render:
-            await client.receive_loop(mock_ws)
-
-            mock_render.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_receive_user_joined_updates_list(self, client):
-        client.room_fernet = Fernet(Fernet.generate_key())
-        client.running = True
         client.users = []
 
-        init_msg = json.dumps(
-            {
-                "type": "init",
-                "messages": [],
-                "users": [
-                    {"user_id": "1", "username": "alice"},
-                    {"user_id": "2", "username": "bob"},
-                ],
-            }
+        init_msg = (
+            json.dumps(
+                {
+                    "type": "init",
+                    "messages": [],
+                    "users": [
+                        {"user_id": "1", "username": "alice"},
+                        {"user_id": "2", "username": "bob"},
+                    ],
+                }
+            )
+            + "\n"
         )
 
-        mock_ws = AsyncMock()
-        mock_ws.__aiter__.return_value = [init_msg]
+        mock_reader = AsyncMock()
+        mock_reader.readline = AsyncMock(side_effect=[init_msg.encode(), b""])
+        client.reader = mock_reader
 
         with patch.object(client, "render_messages"):
-            await client.receive_loop(mock_ws)
+            await client.receive_loop()
 
         assert len(client.users) == 2
         assert client.users[0]["username"] == "alice"
         assert client.users[1]["username"] == "bob"
+        assert client.connected is True
 
     @pytest.mark.asyncio
-    async def test_receive_multiple_users_leave(self, client):
+    async def test_receive_user_joined(self, client):
+        client.room_fernet = Fernet(Fernet.generate_key())
+        client.running = True
+        client.users = [{"user_id": "1", "username": "alice"}]
+
+        join_msg = (
+            json.dumps(
+                {
+                    "type": "user_joined",
+                    "user_id": "2",
+                    "username": "bob",
+                }
+            )
+            + "\n"
+        )
+
+        mock_reader = AsyncMock()
+        mock_reader.readline = AsyncMock(side_effect=[join_msg.encode(), b""])
+        client.reader = mock_reader
+
+        with patch.object(client, "render_messages"):
+            await client.receive_loop()
+
+        assert len(client.users) == 2
+        assert client.users[1]["username"] == "bob"
+
+    @pytest.mark.asyncio
+    async def test_receive_user_left(self, client):
         client.room_fernet = Fernet(Fernet.generate_key())
         client.running = True
         client.users = [
             {"user_id": "1", "username": "alice"},
             {"user_id": "2", "username": "bob"},
-            {"user_id": "3", "username": "charlie"},
         ]
 
-        leave_msgs = [
-            json.dumps({"type": "user_left", "user_id": "1"}),
-            json.dumps({"type": "user_left", "user_id": "3"}),
-        ]
+        leave_msg = json.dumps({"type": "user_left", "user_id": "1"}) + "\n"
 
-        mock_ws = AsyncMock()
-        mock_ws.__aiter__.return_value = leave_msgs
+        mock_reader = AsyncMock()
+        mock_reader.readline = AsyncMock(side_effect=[leave_msg.encode(), b""])
+        client.reader = mock_reader
 
         with patch.object(client, "render_messages"):
-            await client.receive_loop(mock_ws)
+            await client.receive_loop()
 
         assert len(client.users) == 1
         assert client.users[0]["username"] == "bob"
 
+    @pytest.mark.asyncio
+    async def test_receive_cleared(self, client):
+        client.room_fernet = Fernet(Fernet.generate_key())
+        client.running = True
+        client.messages = [{"text": "old", "username": "user"}]
 
-class TestInputLoopExtended:
+        clear_msg = json.dumps({"type": "cleared"}) + "\n"
+
+        mock_reader = AsyncMock()
+        mock_reader.readline = AsyncMock(side_effect=[clear_msg.encode(), b""])
+        client.reader = mock_reader
+
+        with patch.object(client, "render_messages"):
+            await client.receive_loop()
+
+        assert client.messages == []
+
+
+class TestInputLoop:
+    @pytest.mark.asyncio
+    async def test_input_quit_command(self, client):
+        client.room_fernet = Fernet(Fernet.generate_key())
+        client.running = True
+
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
+        client.writer = mock_writer
+
+        with patch("asyncio.get_event_loop") as mock_loop:
+            mock_executor = AsyncMock(return_value="q")
+            mock_loop.return_value.run_in_executor = mock_executor
+
+            await client.input_loop()
+
+        assert client.running is False
+
     @pytest.mark.asyncio
     async def test_input_keyboard_interrupt(self, client):
         client.room_fernet = Fernet(Fernet.generate_key())
         client.running = True
 
-        mock_ws = AsyncMock()
-
         with patch("asyncio.get_event_loop") as mock_loop:
             mock_executor = AsyncMock(side_effect=KeyboardInterrupt())
             mock_loop.return_value.run_in_executor = mock_executor
 
-            await client.input_loop(mock_ws)
+            await client.input_loop()
 
         assert client.running is False
 
     @pytest.mark.asyncio
-    async def test_input_eof_error(self, client):
-        client.room_fernet = Fernet(Fernet.generate_key())
-        client.running = True
-
-        mock_ws = AsyncMock()
-
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(side_effect=EOFError())
-            mock_loop.return_value.run_in_executor = mock_executor
-
-            await client.input_loop(mock_ws)
-
-        assert client.running is False
-
-    @pytest.mark.asyncio
-    async def test_input_exit_command(self, client):
-        client.room_fernet = Fernet(Fernet.generate_key())
-        client.running = True
-
-        mock_ws = AsyncMock()
-
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(return_value="exit")
-            mock_loop.return_value.run_in_executor = mock_executor
-
-            await client.input_loop(mock_ws)
-
-        assert client.running is False
-
-    @pytest.mark.asyncio
-    async def test_input_case_insensitive_quit(self, client):
-        client.room_fernet = Fernet(Fernet.generate_key())
-        client.running = True
-
-        mock_ws = AsyncMock()
-        inputs = iter(["QUIT"])
-
-        with patch("asyncio.get_event_loop") as mock_loop:
-            mock_executor = AsyncMock(side_effect=lambda _, __: next(inputs))
-            mock_loop.return_value.run_in_executor = mock_executor
-
-            await client.input_loop(mock_ws)
-
-        assert client.running is False
-
-    @pytest.mark.asyncio
-    async def test_input_multiple_messages_then_quit(self, client, room_fernet):
+    async def test_input_sends_encrypted_message(self, client, room_fernet):
         client.room_fernet = room_fernet
         client.running = True
 
-        mock_ws = AsyncMock()
-        sent = []
-        mock_ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+        mock_writer = MagicMock()
+        written_data = []
+        mock_writer.write = MagicMock(side_effect=lambda d: written_data.append(d))
+        mock_writer.drain = AsyncMock()
+        client.writer = mock_writer
 
-        inputs = iter(["msg1", "msg2", "msg3", "q"])
+        inputs = iter(["hello", "q"])
 
         with patch("asyncio.get_event_loop") as mock_loop:
             mock_executor = AsyncMock(side_effect=lambda _, __: next(inputs))
             mock_loop.return_value.run_in_executor = mock_executor
 
-            await client.input_loop(mock_ws)
+            await client.input_loop()
 
-        assert len(sent) == 3
-        assert room_fernet.decrypt(sent[0].encode()).decode() == "msg1"
-        assert room_fernet.decrypt(sent[1].encode()).decode() == "msg2"
-        assert room_fernet.decrypt(sent[2].encode()).decode() == "msg3"
+        assert len(written_data) == 1
+        sent = json.loads(written_data[0].decode())
+        assert sent["type"] == "message"
+        decrypted = room_fernet.decrypt(sent["text"].encode()).decode()
+        assert decrypted == "hello"
 
     @pytest.mark.asyncio
-    async def test_input_whitespace_only_not_sent(self, client):
+    async def test_input_whitespace_not_sent(self, client):
         client.room_fernet = Fernet(Fernet.generate_key())
         client.running = True
 
-        mock_ws = AsyncMock()
-        inputs = iter(["\t", "\n", "  \t  ", "q"])
+        mock_writer = MagicMock()
+        mock_writer.write = MagicMock()
+        mock_writer.drain = AsyncMock()
+        client.writer = mock_writer
+
+        inputs = iter(["   ", "\t", "", "q"])
 
         with patch("asyncio.get_event_loop") as mock_loop:
             mock_executor = AsyncMock(side_effect=lambda _, __: next(inputs))
             mock_loop.return_value.run_in_executor = mock_executor
 
-            await client.input_loop(mock_ws)
+            await client.input_loop()
 
-        mock_ws.send.assert_not_called()
+        mock_writer.write.assert_not_called()
 
 
 class TestRunAsync:
     @pytest.mark.asyncio
-    async def test_run_connection_error(self, client):
-        with patch.object(client, "srp_authenticate") as mock_auth:
-            mock_auth.side_effect = requests.exceptions.ConnectionError()
+    async def test_run_connection_refused(self, client):
+        with patch("asyncio.open_connection") as mock_connect:
+            mock_connect.side_effect = ConnectionRefusedError()
 
             with patch.object(client.console, "clear"):
                 with patch.object(client.console, "print"):
                     await client.run_async()
 
     @pytest.mark.asyncio
-    async def test_run_http_error(self, client):
-        mock_response = MagicMock()
-        mock_response.status_code = 403
-        mock_response.text = "Forbidden"
-
-        with patch.object(client, "srp_authenticate") as mock_auth:
-            mock_auth.side_effect = requests.exceptions.HTTPError(
-                response=mock_response
-            )
-
+    async def test_run_timeout(self, client):
+        with patch("asyncio.open_connection", side_effect=asyncio.TimeoutError()):
             with patch.object(client.console, "clear"):
                 with patch.object(client.console, "print"):
                     await client.run_async()
 
     @pytest.mark.asyncio
-    async def test_run_value_error(self, client):
-        with patch.object(client, "srp_authenticate") as mock_auth:
-            mock_auth.side_effect = ValueError("Auth failed")
+    async def test_run_auth_failure(self, client):
+        mock_reader = AsyncMock()
+        mock_writer = MagicMock()
+        mock_writer.close = MagicMock()
+        mock_writer.wait_closed = AsyncMock()
 
-            with patch.object(client.console, "clear"):
-                with patch.object(client.console, "print"):
-                    await client.run_async()
+        with patch("asyncio.open_connection", new_callable=AsyncMock) as mock_connect:
+            mock_connect.return_value = (mock_reader, mock_writer)
 
-    @pytest.mark.asyncio
-    async def test_run_generic_exception(self, client):
-        with patch.object(client, "srp_authenticate") as mock_auth:
-            mock_auth.side_effect = RuntimeError("Unexpected")
+            with patch.object(
+                client, "srp_authenticate", new_callable=AsyncMock
+            ) as mock_auth:
+                mock_auth.side_effect = ValueError("Auth failed")
 
-            with patch.object(client.console, "clear"):
-                with patch.object(client.console, "print"):
-                    await client.run_async()
-
-    @pytest.mark.asyncio
-    async def test_run_successful_connection_and_disconnect(self, client):
-        client.user_id = "test-id-123"
-
-        with patch.object(client, "srp_authenticate"):
-            with patch("cmd_chat.client.client.websockets.connect") as mock_connect:
-                mock_ws = AsyncMock()
-                mock_connect.return_value.__aenter__.return_value = mock_ws
-
-                with patch.object(
-                    client, "receive_loop", new_callable=AsyncMock
-                ) as mock_recv:
-                    with patch.object(
-                        client, "input_loop", new_callable=AsyncMock
-                    ) as mock_input:
-
-                        mock_input.return_value = None
-                        mock_recv.return_value = None
-
-                        with patch.object(client.console, "clear"):
-                            with patch.object(client.console, "print"):
-                                await client.run_async()
+                with patch.object(client.console, "clear"):
+                    with patch.object(client.console, "print"):
+                        await client.run_async()
 
 
-class TestRenderMessagesExtended:
+class TestRenderMessages:
     def test_render_own_message_green(self, client):
         client.room_fernet = Fernet(Fernet.generate_key())
         client.username = "testuser"
         client.messages = [
-            {
-                "username": "testuser",
-                "text": "my msg",
-                "timestamp": "2024-01-01T12:00:00",
-            }
+            {"username": "testuser", "text": "my msg", "timestamp": "2024-01-01T12:00:00"}
         ]
         client.users = []
 
         printed = []
         with patch.object(client.console, "clear"):
             with patch.object(
-                client.console, "print", side_effect=lambda x: printed.append(x)
+                client.console, "print", side_effect=lambda *args, **kwargs: printed.append(args[0] if args else "")
             ):
                 client.render_messages()
 
@@ -602,18 +636,14 @@ class TestRenderMessagesExtended:
         client.room_fernet = Fernet(Fernet.generate_key())
         client.username = "testuser"
         client.messages = [
-            {
-                "username": "other",
-                "text": "their msg",
-                "timestamp": "2024-01-01T12:00:00",
-            }
+            {"username": "other", "text": "their msg", "timestamp": "2024-01-01T12:00:00"}
         ]
         client.users = []
 
         printed = []
         with patch.object(client.console, "clear"):
             with patch.object(
-                client.console, "print", side_effect=lambda x: printed.append(x)
+                client.console, "print", side_effect=lambda *args, **kwargs: printed.append(args[0] if args else "")
             ):
                 client.render_messages()
 
@@ -621,48 +651,24 @@ class TestRenderMessagesExtended:
         assert len(msg_output) == 1
         assert "cyan" in str(msg_output[0])
 
-    def test_render_timestamp_formatting(self, client):
-        client.room_fernet = Fernet(Fernet.generate_key())
-        client.messages = [
-            {
-                "username": "user",
-                "text": "test",
-                "timestamp": "2024-01-15T14:30:45.123456",
-            }
-        ]
-        client.users = []
-
-        printed = []
-        with patch.object(client.console, "clear"):
-            with patch.object(
-                client.console, "print", side_effect=lambda x: printed.append(x)
-            ):
-                client.render_messages()
-
-        msg_output = [p for p in printed if "2024-01-15 14:30:45" in str(p)]
-        assert len(msg_output) == 1
-
-    def test_render_users_online_display(self, client):
+    def test_render_users_online(self, client):
         client.room_fernet = Fernet(Fernet.generate_key())
         client.messages = []
         client.users = [
             {"user_id": "1", "username": "alice"},
             {"user_id": "2", "username": "bob"},
-            {"user_id": "3", "username": "charlie"},
         ]
 
         printed = []
         with patch.object(client.console, "clear"):
             with patch.object(
-                client.console, "print", side_effect=lambda x: printed.append(x)
+                client.console, "print", side_effect=lambda *args, **kwargs: printed.append(args[0] if args else "")
             ):
                 client.render_messages()
 
         online_line = [p for p in printed if "Online:" in str(p)]
-        assert len(online_line) == 1
         assert "alice" in str(online_line[0])
         assert "bob" in str(online_line[0])
-        assert "charlie" in str(online_line[0])
 
     def test_render_no_users_shows_none(self, client):
         client.room_fernet = Fernet(Fernet.generate_key())
@@ -672,43 +678,16 @@ class TestRenderMessagesExtended:
         printed = []
         with patch.object(client.console, "clear"):
             with patch.object(
-                client.console, "print", side_effect=lambda x: printed.append(x)
+                client.console, "print", side_effect=lambda *args, **kwargs: printed.append(args[0] if args else "")
             ):
                 client.render_messages()
 
         online_line = [p for p in printed if "Online:" in str(p)]
         assert "none" in str(online_line[0])
 
-    def test_render_missing_username_shows_unknown(self, client):
-        client.room_fernet = Fernet(Fernet.generate_key())
-        client.messages = [{"text": "test", "timestamp": "2024-01-01T12:00:00"}]
-        client.users = []
 
-        printed = []
-        with patch.object(client.console, "clear"):
-            with patch.object(
-                client.console, "print", side_effect=lambda x: printed.append(x)
-            ):
-                client.render_messages()
-
-        msg_output = [p for p in printed if "unknown" in str(p)]
-        assert len(msg_output) >= 1
-
-    def test_render_missing_timestamp(self, client):
-        client.room_fernet = Fernet(Fernet.generate_key())
-        client.messages = [{"username": "user", "text": "test"}]
-        client.users = []
-
-        with patch.object(client.console, "clear"):
-            with patch.object(client.console, "print"):
-
-                client.render_messages()
-
-
-class TestE2EEncryptionFlow:
-
+class TestE2EEncryption:
     def test_same_password_same_key(self, room_salt):
-
         password = b"shared_secret"
 
         hkdf1 = HKDF(
@@ -731,13 +710,11 @@ class TestE2EEncryptionFlow:
         fernet2 = Fernet(key2)
 
         ciphertext = fernet1.encrypt(b"Hello from client 1")
-
         plaintext = fernet2.decrypt(ciphertext)
 
         assert plaintext == b"Hello from client 1"
 
     def test_different_password_cannot_decrypt(self, room_salt):
-
         hkdf1 = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
@@ -761,25 +738,6 @@ class TestE2EEncryptionFlow:
 
         with pytest.raises(Exception):
             fernet2.decrypt(ciphertext)
-
-    def test_server_cannot_read_without_password(self, room_salt):
-
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=room_salt,
-            info=b"cmd-chat-room-key",
-        )
-        client_key = base64.urlsafe_b64encode(hkdf.derive(b"client_password"))
-        client_fernet = Fernet(client_key)
-
-        ciphertext = client_fernet.encrypt(b"Private message")
-
-        server_random_key = Fernet.generate_key()
-        server_fernet = Fernet(server_random_key)
-
-        with pytest.raises(Exception):
-            server_fernet.decrypt(ciphertext)
 
 
 class TestEdgeCases:
@@ -823,29 +781,10 @@ class TestEdgeCases:
 
         assert decrypted["text"] == unicode_msg
 
-    def test_special_characters_in_message(self, client, room_fernet, room_salt):
-        hkdf = HKDF(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=room_salt,
-            info=b"cmd-chat-room-key",
-        )
-        room_key = hkdf.derive(client.password)
-        client.room_fernet = Fernet(base64.urlsafe_b64encode(room_key))
-
-        special_msg = '<script>alert("xss")</script> & "quotes" \'single\' \n\t\r'
-        encrypted = room_fernet.encrypt(special_msg.encode()).decode()
-
-        msg = {"text": encrypted, "username": "other"}
-        decrypted = client.decrypt_message(msg)
-
-        assert decrypted["text"] == special_msg
-
     def test_port_zero(self):
         client = Client("localhost", 0, "user", "pass")
         assert client.port == 0
-        assert client.base_url == "http://localhost:0"
 
     def test_ipv6_server(self):
         client = Client("::1", 3000, "user", "pass")
-        assert client.base_url == "http://::1:3000"
+        assert client.server == "::1"

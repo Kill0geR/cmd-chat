@@ -1,6 +1,7 @@
 import argparse
-from cmd_chat.server.server import run_server
-from cmd_chat.client.client import Client
+
+from cmd_chat.server import run_server
+from cmd_chat.client import Client
 
 
 def main():

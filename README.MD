@@ -26,43 +26,40 @@ every "secure" messenger still stores metadata somewhere. this doesn't. it's jus
 │                                                                  │
 │  CLIENT                                         SERVER           │
 │    │                                              │              │
-│    │─────── POST /srp/init {username, A} ───────► │              │
+│    │══════════════ TCP CONNECT ══════════════════►│              │
+│    │                                              │              │
+│    │─── {"cmd":"srp_init","username","A"} ──────► │              │
 │    │         (A = client public ephemeral)        │              │
 │    │                                              │              │
-│    │◄──── {user_id, B, salt, room_salt} ───────── │              │
+│    │◄──── {"user_id","B","salt","room_salt"} ──── │              │
 │    │         (B = server public ephemeral)        │              │
-│    │         (room_salt = E2E key derivation)     │              │
 │    │                                              │              │
 │    │  [client derives room_key via HKDF:          │              │
 │    │   room_key = HKDF(password, room_salt)]      │              │
 │    │                                              │              │
-│    │  [both sides compute SRP session key         │              │
-│    │   using password + ephemeral values]         │              │
-│    │                                              │              │
-│    │─────── POST /srp/verify {user_id, M} ──────► │              │
+│    │─── {"cmd":"srp_verify","user_id","M"} ─────► │              │
 │    │         (M = client proof)                   │              │
 │    │                                              │              │
-│    │◄────────── {H_AMK, session_key} ──────────── │              │
+│    │◄──────── {"H_AMK","session_key"} ─────────── │              │
 │    │         (H_AMK = server proof)               │              │
 │    │                                              │              │
 │    │  [password never transmitted]                │              │
 │    │  [MITM can't derive session key]             │              │
 │    │                                              │              │
 ├──────────────────────────────────────────────────────────────────┤
-│                      E2E ENCRYPTED CHAT                          │
+│                 E2E ENCRYPTED CHAT (same socket)                 │
 ├──────────────────────────────────────────────────────────────────┤
 │    │                                              │              │
-│    │═══════ WebSocket /ws/chat?user_id ═════════► │              │
-│    │         (authenticated session)              │              │
-│    │                                              │              │
+│    │◄─────── {"type":"init","messages","users"} ─ │              │
 │    │                                              │              │
 │  ┌─┴─┐                                        ┌──┴──┐            │
-│  │ C │──── encrypt(msg, room_key) ───────────►│  S  │            │
+│  │ C │─ {"type":"message","text":encrypted} ─►│  S  │            │
 │  │ L │                                        │  E  │            │
-│  │ I │◄─── ciphertext (broadcast) ────────────│  R  │            │
+│  │ I │◄── {"type":"message","data":{...}} ────│  R  │            │
 │  │ E │                                        │  V  │            │
-│  │ N │     decrypt(ciphertext, room_key)      │  E  │            │
+│  │ N │◄── {"type":"user_joined",...} ─────────│  E  │            │
 │  │ T │                                        │  R  │            │
+│  │   │◄── {"type":"user_left",...} ───────────│     │            │
 │  └─┬─┘                                        └──┬──┘            │
 │    │                                              │              │
 │    │  [server stores ONLY ciphertext]             │              │
@@ -72,6 +69,7 @@ every "secure" messenger still stores metadata somewhere. this doesn't. it's jus
 │    │                                              │              │
 │    │  Encryption: Fernet (AES-128-CBC + HMAC)     │              │
 │    │  Key derivation: HKDF-SHA256                 │              │
+│    │  Protocol: newline-delimited JSON over TCP   │              │
 │    │                                              │              │
 │    │  [on disconnect: keys wiped from RAM]        │              │
 │    │                                              │              │
@@ -126,9 +124,10 @@ python cmd_chat.py connect SERVER_IP 3000 username mysecret
 ## features
 
 - **ram only** — nothing touches disk
-- **rsa + aes** — key exchange + symmetric encryption
-- **no central server** — direct p2p connection
+- **pure sockets** — no http, no websocket, just raw tcp
 - **srp auth** — password never sent over network
+- **e2e encryption** — Fernet (AES-128-CBC + HMAC)
+- **zero dependencies on web frameworks** — only asyncio
 
 ## license
 

@@ -13,7 +13,6 @@ class MessageStore:
         return self._messages.copy()
 
     def clear(self) -> None:
-        count = len(self._messages)
         self._messages.clear()
 
     def count(self) -> int:
@@ -35,8 +34,7 @@ class UserSessionStore:
             session.update_activity()
 
     def remove(self, user_id: str) -> None:
-        if user_id in self._sessions:
-            del self._sessions[user_id]
+        self._sessions.pop(user_id, None)
 
     def cleanup_stale(self, timeout_seconds: int = 3600) -> int:
         stale_ids = [

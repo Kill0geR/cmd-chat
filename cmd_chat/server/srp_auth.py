@@ -4,7 +4,6 @@ from uuid import uuid4
 
 import srp
 
-
 srp.rfc5054_enable()
 
 

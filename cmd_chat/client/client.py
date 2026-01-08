@@ -4,15 +4,24 @@ import base64
 from typing import Optional
 
 import srp
-import requests
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
-import websockets
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 
 srp.rfc5054_enable()
+
+BANNER = """
+[bold cyan]   ██████╗███╗   ███╗██████╗      ██████╗██╗  ██╗ █████╗ ████████╗[/]
+[bold cyan]  ██╔════╝████╗ ████║██╔══██╗    ██╔════╝██║  ██║██╔══██╗╚══██╔══╝[/]
+[bold cyan]  ██║     ██╔████╔██║██║  ██║    ██║     ███████║███████║   ██║   [/]
+[bold cyan]  ██║     ██║╚██╔╝██║██║  ██║    ██║     ██╔══██║██╔══██║   ██║   [/]
+[bold cyan]  ╚██████╗██║ ╚═╝ ██║██████╔╝    ╚██████╗██║  ██║██║  ██║   ██║   [/]
+[bold cyan]   ╚═════╝╚═╝     ╚═╝╚═════╝      ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   [/]
+[dim]                written by [bold magenta]SNEAKYBEAKY[/] with [bold red]♥[/][/]
+"""
 
 
 class Client:
@@ -33,13 +42,8 @@ class Client:
         self.connected = False
         self.running = False
 
-    @property
-    def base_url(self) -> str:
-        return f"http://{self.server}:{self.port}"
-
-    @property
-    def ws_url(self) -> str:
-        return f"ws://{self.server}:{self.port}"
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
 
     def success(self, message: str) -> None:
         self.console.print(f"[green]✓ {message}[/]")
@@ -50,62 +54,73 @@ class Client:
     def info(self, message: str) -> None:
         self.console.print(f"[cyan]• {message}[/]")
 
-    def srp_authenticate(self) -> None:
-        with self.console.status("[cyan]Starting SRP handshake...[/]", spinner="dots"):
+    async def send_json(self, data: dict) -> None:
+        line = json.dumps(data) + "\n"
+        self.writer.write(line.encode())
+        await self.writer.drain()
 
-            usr = srp.User(b"chat", self.password, hash_alg=srp.SHA256)
-            _, A = usr.start_authentication()
+    async def recv_json(self) -> dict:
+        line = await self.reader.readline()
+        if not line:
+            raise ConnectionError("Connection closed")
+        return json.loads(line.decode())
 
-            resp = requests.post(
-                f"{self.base_url}/srp/init",
-                json={
-                    "username": self.username,
-                    "A": base64.b64encode(A).decode(),
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            init_data = resp.json()
+    async def srp_authenticate(self) -> None:
+        self.info("Starting SRP handshake...")
 
-            self.user_id = init_data["user_id"]
-            B = base64.b64decode(init_data["B"])
-            salt = base64.b64decode(init_data["salt"])
-            room_salt = base64.b64decode(init_data["room_salt"])
+        usr = srp.User(b"chat", self.password, hash_alg=srp.SHA256)
+        _, A = usr.start_authentication()
 
-            hkdf = HKDF(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=room_salt,
-                info=b"cmd-chat-room-key",
-            )
-            room_key = hkdf.derive(self.password)
-            self.room_fernet = Fernet(base64.urlsafe_b64encode(room_key))
+        await self.send_json(
+            {
+                "cmd": "srp_init",
+                "username": self.username,
+                "A": base64.b64encode(A).decode(),
+            }
+        )
 
-            M = usr.process_challenge(salt, B)
+        init_data = await self.recv_json()
+        if "error" in init_data:
+            raise ValueError(init_data["error"])
 
-            if M is None:
-                raise ValueError("SRP challenge processing failed")
+        self.user_id = init_data["user_id"]
+        B = base64.b64decode(init_data["B"])
+        salt = base64.b64decode(init_data["salt"])
+        room_salt = base64.b64decode(init_data["room_salt"])
 
-            resp = requests.post(
-                f"{self.base_url}/srp/verify",
-                json={
-                    "user_id": self.user_id,
-                    "username": self.username,
-                    "M": base64.b64encode(M).decode(),
-                },
-                timeout=30,
-            )
-            resp.raise_for_status()
-            verify_data = resp.json()
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=room_salt,
+            info=b"cmd-chat-room-key",
+        )
+        room_key = hkdf.derive(self.password)
+        self.room_fernet = Fernet(base64.urlsafe_b64encode(room_key))
 
-            H_AMK = base64.b64decode(verify_data["H_AMK"])
-            usr.verify_session(H_AMK)
+        M = usr.process_challenge(salt, B)
+        if M is None:
+            raise ValueError("SRP challenge processing failed")
 
-            if not usr.authenticated():
-                raise ValueError("Server authentication failed")
+        await self.send_json(
+            {
+                "cmd": "srp_verify",
+                "user_id": self.user_id,
+                "M": base64.b64encode(M).decode(),
+            }
+        )
 
-            session_key = base64.b64decode(verify_data["session_key"])
-            self.fernet = Fernet(session_key)
+        verify_data = await self.recv_json()
+        if "error" in verify_data:
+            raise ValueError(verify_data["error"])
+
+        H_AMK = base64.b64decode(verify_data["H_AMK"])
+        usr.verify_session(H_AMK)
+
+        if not usr.authenticated():
+            raise ValueError("Server authentication failed")
+
+        session_key = base64.b64decode(verify_data["session_key"])
+        self.fernet = Fernet(session_key)
 
         self.success(f"SRP authenticated (session: {self.user_id[:8]}...)")
 
@@ -120,6 +135,8 @@ class Client:
 
     def render_messages(self) -> None:
         self.console.clear()
+        self.console.print(BANNER)
+        self.console.print()
 
         users_online = ", ".join(u.get("username", "?") for u in self.users) or "none"
         self.console.print(f"[dim]Online: {users_online}[/]")
@@ -133,7 +150,6 @@ class Client:
             username = msg.get("username", "unknown")
             text = msg.get("text", "")
             timestamp = str(msg.get("timestamp", ""))[:19].replace("T", " ")
-
             style = "green" if username == self.username else "cyan"
             self.console.print(f"[dim]{timestamp}[/] [{style}]{username}[/]: {text}")
 
@@ -143,20 +159,20 @@ class Client:
         self.console.print("─" * 60)
         self.console.print("[dim]Type message and press Enter. 'q' to quit.[/]")
 
-    async def receive_loop(self, ws) -> None:
+    async def receive_loop(self) -> None:
         try:
-            async for raw in ws:
-                if not self.running:
+            while self.running:
+                line = await self.reader.readline()
+                if not line:
                     break
 
-                data = json.loads(raw)
+                data = json.loads(line.decode())
                 msg_type = data.get("type", "")
 
                 if msg_type == "init":
-                    messages = [
+                    self.messages = [
                         self.decrypt_message(m) for m in data.get("messages", [])
                     ]
-                    self.messages = messages
                     self.users = data.get("users", [])
                     self.connected = True
                     self.render_messages()
@@ -164,15 +180,27 @@ class Client:
                     msg_data = self.decrypt_message(data.get("data", {}))
                     self.messages.append(msg_data)
                     self.render_messages()
+                elif msg_type == "user_joined":
+                    self.users.append(
+                        {
+                            "user_id": data.get("user_id"),
+                            "username": data.get("username"),
+                        }
+                    )
+                    self.render_messages()
                 elif msg_type == "user_left":
                     left_id = data.get("user_id")
                     self.users = [u for u in self.users if u.get("user_id") != left_id]
                     self.render_messages()
-
-        except websockets.ConnectionClosed:
+                elif msg_type == "cleared":
+                    self.messages = []
+                    self.render_messages()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
             self.connected = False
 
-    async def input_loop(self, ws) -> None:
+    async def input_loop(self) -> None:
         loop = asyncio.get_event_loop()
         while self.running:
             try:
@@ -182,42 +210,50 @@ class Client:
                     break
                 if text.strip():
                     encrypted = self.room_fernet.encrypt(text.encode()).decode()
-                    await ws.send(encrypted)
+                    await self.send_json({"type": "message", "text": encrypted})
             except (EOFError, KeyboardInterrupt):
                 self.running = False
+                break
+            except asyncio.CancelledError:
                 break
 
     async def run_async(self) -> None:
         self.console.clear()
-        self.console.print(Panel("[bold cyan]CMD Chat Client[/]", expand=False))
+        self.console.print(BANNER)
         self.console.print()
 
         try:
-            self.srp_authenticate()
+            self.info(f"Connecting to {self.server}:{self.port}...")
+            self.reader, self.writer = await asyncio.wait_for(
+                asyncio.open_connection(self.server, self.port), timeout=10.0
+            )
+            self.success("Connected")
 
-            self.info("Connecting to chat...")
-            url = f"{self.ws_url}/ws/chat?user_id={self.user_id}"
+            await self.srp_authenticate()
+            self.running = True
 
-            async with websockets.connect(url) as ws:
-                self.success("Connected to chat server")
-                self.running = True
+            receive_task = asyncio.create_task(self.receive_loop())
+            input_task = asyncio.create_task(self.input_loop())
 
-                receive_task = asyncio.create_task(self.receive_loop(ws))
-                input_task = asyncio.create_task(self.input_loop(ws))
+            done, pending = await asyncio.wait(
+                [receive_task, input_task], return_when=asyncio.FIRST_COMPLETED
+            )
 
-                done, pending = await asyncio.wait(
-                    [receive_task, input_task], return_when=asyncio.FIRST_COMPLETED
-                )
-
-                for task in pending:
-                    task.cancel()
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
             self.console.print("\n[yellow]Disconnected[/]")
 
-        except requests.exceptions.ConnectionError:
-            self.error(f"Cannot connect to {self.base_url}")
-        except requests.exceptions.HTTPError as e:
-            self.error(f"Server error: {e.response.status_code} - {e.response.text}")
+        except asyncio.TimeoutError:
+            self.error(f"Connection timeout to {self.server}:{self.port}")
+        except ConnectionRefusedError:
+            self.error(f"Cannot connect to {self.server}:{self.port}")
+        except ConnectionError as e:
+            self.error(f"Connection error: {e}")
         except ValueError as e:
             self.error(f"Authentication failed: {e}")
         except Exception:
@@ -225,6 +261,13 @@ class Client:
 
             self.error("Error occurred")
             traceback.print_exc()
+        finally:
+            if self.writer:
+                self.writer.close()
+                try:
+                    await self.writer.wait_closed()
+                except Exception:
+                    pass
 
     def run(self) -> None:
         asyncio.run(self.run_async())
