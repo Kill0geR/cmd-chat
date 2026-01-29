@@ -20,7 +20,7 @@ BANNER = """
 [bold cyan]  ██║     ██║╚██╔╝██║██║  ██║    ██║     ██╔══██║██╔══██║   ██║   [/]
 [bold cyan]  ╚██████╗██║ ╚═╝ ██║██████╔╝    ╚██████╗██║  ██║██║  ██║   ██║   [/]
 [bold cyan]   ╚═════╝╚═╝     ╚═╝╚═════╝      ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝   [/]
-[dim]                written by [bold magenta]SNEAKYBEAKY[/] with [bold red]♥[/][/]
+[dim]                written by [bold magenta]Kill0geR & SNEAKYBEAKY[/] with [bold red]♥[/][/]
 """
 
 
@@ -208,9 +208,14 @@ class Client:
                 if text.lower() in ("q", "quit", "exit"):
                     self.running = False
                     break
-                if text.strip():
+
+                if text.strip() and text.strip() != "cleared":
                     encrypted = self.room_fernet.encrypt(text.encode()).decode()
                     await self.send_json({"type": "message", "text": encrypted})
+
+                else:
+                    await self.send_json({"type": "cleared"})
+
             except (EOFError, KeyboardInterrupt):
                 self.running = False
                 break
